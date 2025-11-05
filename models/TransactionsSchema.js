@@ -6,6 +6,7 @@ const TransactionsSchema = new mongoose.Schema({
   amount: { type: Number, required: true },
   timestamp: { type: Date, default: Date.now },
   blockHash: { type: String, required: true },
+  ethereumTxHash: { type: String, default: null },
   broadcasted: {type: Boolean, default: true},
   status: { type: String, enum: ['completed', 'failed'], default: 'completed' },
 });
