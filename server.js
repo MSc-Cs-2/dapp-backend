@@ -5,26 +5,38 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const { spawn } = require('child_process');
 const { ethers } = require('ethers');
+const http = require('http'); // Added for Socket.IO
+const { Server } = require('socket.io'); // Added for Socket.IO
 
 const TransactionsSchema = require('./models/TransactionsSchema');
 
 dotenv.config();
 const app = express();
+const server = http.createServer(app); // Create HTTP server manually
+const io = new Server(server, { cors: { origin: '*' } }); // Enable Socket.IO
+
 app.use(cors());
 app.use(express.json());
+
+// Custom log emitter (logs to console + sends to browser)
+function logToClient(msg) {
+  console.log(msg);
+  io.emit('server-log', msg);
+}
 
 // Ethereum setup (optional on-chain logging)
 const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
 const wallet = new ethers.Wallet(process.env.SEPOLIA_PRIVATE_KEY || '', provider);
 
+// MongoDB connection
 mongoose.connect(process.env.MONGOURI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
 })
-  .then(() => console.log('✅ MongoDB connection success!'))
-  .catch((e) => console.error(`❌ MongoDB connection error: ${e}`));
+  .then(() => logToClient('✅ MongoDB connection success!'))
+  .catch((e) => logToClient(`❌ MongoDB connection error: ${e}`));
 
-
+// Helper: get PayPal access token
 async function getPayPalAccessToken() {
   const res = await axios({
     url: `${process.env.PAYPAL_API}/v1/oauth2/token`,
@@ -39,23 +51,18 @@ async function getPayPalAccessToken() {
   return res.data.access_token;
 }
 
-
+// Route: Send Money
 app.post('/send-money', async (req, res) => {
-  const logs = []; // Log collector for browser console
-
   try {
     const { sender, recipient, amount, signature, broadcastToEthereum } = req.body;
 
     if (!sender || !recipient || !amount || !signature) {
-      console.warn('⚠️ Missing sender, recipient, amount, or signature.');
-      logs.push('⚠️ Missing sender, recipient, amount, or signature.');
-      return res.status(400).json({ error: 'Missing sender/recipient/amount/signature', logs });
+      logToClient('⚠️ Missing sender, recipient, amount, or signature.');
+      return res.status(400).json({ error: 'Missing sender/recipient/amount/signature' });
     }
 
-    console.log(`💸 Verifying transaction: ${amount} USD from ${sender} → ${recipient}`);
-    logs.push(`💸 Verifying transaction: ${amount} USD from ${sender} → ${recipient}`);
-    console.log('🚦 Starting blockchain verification process...');
-    logs.push('🚦 Starting blockchain verification process...');
+    logToClient(`💸 Verifying transaction: ${amount} USD from ${sender} → ${recipient}`);
+    logToClient('🚦 Starting blockchain verification process...');
 
     const python = spawn('python', ['../blockchain/blockchain.py']);
     python.stdin.write(JSON.stringify({ sender, recipient, amount, signature }));
@@ -66,30 +73,24 @@ app.post('/send-money', async (req, res) => {
       try {
         result = JSON.parse(data.toString());
       } catch (e) {
-        console.error('❌ Invalid JSON from Python script:', data.toString());
-        logs.push('❌ Invalid JSON from Python script');
-        console.log('🏁 Execution complete — invalid verifier output.');
-        logs.push('🏁 Execution complete — invalid verifier output.');
-        return res.status(500).json({ error: 'Invalid verifier output', logs });
+        logToClient('❌ Invalid JSON from Python script: ' + data.toString());
+        logToClient('🏁 Execution complete — invalid verifier output.');
+        return res.status(500).json({ error: 'Invalid verifier output' });
       }
 
       if (!result.valid) {
-        console.warn('❌ Transaction verification failed:', result.error);
-        logs.push(`❌ Transaction verification failed: ${result.error}`);
-        console.log('🏁 Execution complete — terminated due to failed verification.');
-        logs.push('🏁 Execution complete — terminated due to failed verification.');
-        return res.status(400).json({ error: 'Transaction verification failed', details: result.error, logs });
+        logToClient('❌ Transaction verification failed: ' + result.error);
+        logToClient('🏁 Execution complete — terminated due to failed verification.');
+        return res.status(400).json({ error: 'Transaction verification failed', details: result.error });
       }
 
       const blockHash = result.block_hash || null;
-      console.log('✅ Verified by blockchain. Block hash:', blockHash);
-      logs.push(`✅ Verified by blockchain. Block hash: ${blockHash}`);
+      logToClient('✅ Verified by blockchain. Block hash: ' + blockHash);
 
       // Ethereum broadcast (optional)
       let ethTxHash = null;
       if (broadcastToEthereum) {
-        console.log('🌐 Broadcasting transaction to Ethereum...');
-        logs.push('🌐 Broadcasting transaction to Ethereum...');
+        logToClient('🌐 Broadcasting transaction to Ethereum...');
         try {
           const metadata = JSON.stringify({
             sender,
@@ -106,24 +107,18 @@ app.post('/send-money', async (req, res) => {
             data: dataHex,
           });
 
-          console.log('🌐 Ethereum tx sent:', tx.hash);
-          logs.push(`🌐 Ethereum tx sent: ${tx.hash}`);
+          logToClient('🌐 Ethereum tx sent: ' + tx.hash);
 
           const receipt = await tx.wait();
           ethTxHash = tx.hash;
-          console.log(`✅ Ethereum tx confirmed (block ${receipt.blockNumber})`);
-          logs.push(`✅ Ethereum tx confirmed (block ${receipt.blockNumber})`);
+          logToClient(`✅ Ethereum tx confirmed (block ${receipt.blockNumber})`);
         } catch (ethErr) {
-          console.error('⚠️ Ethereum logging failed:', ethErr.message || ethErr);
-          logs.push(`⚠️ Ethereum logging failed: ${ethErr.message || ethErr}`);
-          console.log('📦 Continuing with PayPal payout (Ethereum skipped)');
-          logs.push('📦 Continuing with PayPal payout (Ethereum skipped)');
+          logToClient('⚠️ Ethereum logging failed: ' + (ethErr.message || ethErr));
+          logToClient('📦 Continuing with PayPal payout (Ethereum skipped)');
         }
       } else {
-        console.log('⏩ Ethereum broadcast skipped — transaction not logged on-chain.');
-        logs.push('⏩ Ethereum broadcast skipped — transaction not logged on-chain.');
-        console.log('📦 Proceeding to PayPal payout...');
-        logs.push('📦 Proceeding to PayPal payout...');
+        logToClient('⏩ Ethereum broadcast skipped — transaction not logged on-chain.');
+        logToClient('📦 Proceeding to PayPal payout...');
       }
 
       // PayPal Payout
@@ -155,10 +150,9 @@ app.post('/send-money', async (req, res) => {
           }
         );
 
-        console.log('✅ PayPal payout successful.');
-        logs.push('✅ PayPal payout successful.');
+        logToClient('✅ PayPal payout successful.');
 
-        // 🗃️ Save to MongoDB
+        // Save to MongoDB
         const newTx = new TransactionsSchema({
           sender,
           recipient,
@@ -170,25 +164,18 @@ app.post('/send-money', async (req, res) => {
         });
 
         await newTx.save();
-        console.log('🗃️ Transaction saved to MongoDB.');
-        logs.push('🗃️ Transaction saved to MongoDB.');
-        console.log('🏁 Execution complete — transaction fully successful.');
-        logs.push('🏁 Execution complete — transaction fully successful.');
+        logToClient('🗃️ Transaction saved to MongoDB.');
+        logToClient('🏁 Execution complete — transaction fully successful.');
 
         return res.json({
           status: 'success',
           python_block_hash: blockHash,
           ethereum_tx_hash: ethTxHash || 'skipped',
           broadcasted_to_ethereum: broadcastToEthereum,
-          broadcast_message: broadcastToEthereum
-            ? 'Transaction was successfully broadcasted to Ethereum network.'
-            : 'Transaction skipped Ethereum broadcast.',
           paypal_response: payoutRes.data,
-          logs, // 🪵 include logs for frontend console
         });
       } catch (paypalErr) {
-        console.error('❌ PayPal payout failed:', paypalErr.response ? paypalErr.response.data : paypalErr.message);
-        logs.push(`❌ PayPal payout failed: ${paypalErr.message}`);
+        logToClient('❌ PayPal payout failed: ' + (paypalErr.response ? JSON.stringify(paypalErr.response.data) : paypalErr.message));
 
         const failedTx = new TransactionsSchema({
           sender,
@@ -201,35 +188,26 @@ app.post('/send-money', async (req, res) => {
         });
 
         await failedTx.save();
-        console.log('⚠️ Failed transaction saved to MongoDB.');
-        logs.push('⚠️ Failed transaction saved to MongoDB.');
-        console.log('🏁 Execution complete — terminated due to PayPal failure.');
-        logs.push('🏁 Execution complete — terminated due to PayPal failure.');
+        logToClient('⚠️ Failed transaction saved to MongoDB.');
+        logToClient('🏁 Execution complete — terminated due to PayPal failure.');
 
         return res.status(500).json({
           error: 'PayPal API error',
           details: paypalErr.response ? paypalErr.response.data : paypalErr.message,
-          logs,
         });
       }
     });
 
-    python.stderr.on('data', (d) => {
-      console.error('🐍 Python stderr:', d.toString());
-      logs.push(`🐍 Python stderr: ${d.toString()}`);
-    });
-
+    python.stderr.on('data', (d) => logToClient('🐍 Python stderr: ' + d.toString()));
     python.on('close', (code) => {
-      console.log(`🐍 Python exited with code: ${code}`);
-      logs.push(`🐍 Python exited with code: ${code}`);
-      console.log('🏁 Request cleanup complete — Python subprocess closed.');
-      logs.push('🏁 Request cleanup complete — Python subprocess closed.');
+      logToClient(`🐍 Python exited with code: ${code}`);
+      logToClient('🏁 Request cleanup complete — Python subprocess closed.');
     });
 
   } catch (err) {
-    console.error('❌ Server error:', err);
-    console.log('🏁 Execution complete — terminated with server error.');
-    return res.status(500).json({ error: 'Server error', logs: [err.message] });
+    logToClient('❌ Server error: ' + err);
+    logToClient('🏁 Execution complete — terminated with server error.');
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -249,10 +227,10 @@ app.post('/transactions', async (req, res) => {
     });
 
     await newTx.save();
-    console.log('🗃️ Custom transaction added to MongoDB.');
+    logToClient('🗃️ Custom transaction added to MongoDB.');
     res.status(201).json(newTx);
   } catch (err) {
-    console.error('❌ Error saving custom transaction:', err.message);
+    logToClient('❌ Error saving custom transaction: ' + err.message);
     res.status(400).json({ error: err.message });
   }
 });
@@ -260,12 +238,23 @@ app.post('/transactions', async (req, res) => {
 app.get('/get-transactions', async (req, res) => {
   try {
     const txs = await TransactionsSchema.find().sort({ timestamp: -1 });
+    console.log(`📊 Transactions fetched: ${txs.length}`);
+
     res.json(txs);
+    // (Optional) emit logs to client via socket.io if you’ve set that up
+    io.emit('serverLog', `📊 Transactions fetched: ${txs.length}`);
+
   } catch (err) {
     console.error('❌ Error fetching transactions:', err.message);
-    res.status(500).json({ err: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.listen(PORT, () => logToClient(`🚀 Server running on port ${PORT}`));
+
+// Handle client connections
+io.on('connection', (socket) => {
+  console.log('🧠 Browser connected for live logs.');
+  socket.emit('server-log', '📡 Connected to live backend logs!');
+});
