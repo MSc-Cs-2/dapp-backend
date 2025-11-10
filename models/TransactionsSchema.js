@@ -7,8 +7,12 @@ const TransactionsSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now },
   blockHash: { type: String, required: true },
   ethereumTxHash: { type: String, default: null },
-  broadcasted: {type: Boolean, default: true},
-  status: { type: String, enum: ['completed', 'failed'], default: 'completed' },
+  broadcasted: { type: Boolean, default: true },
+  status: {
+    type: String,
+    enum: ['completed', 'failed', 'partial'], // allowed values
+    default: 'completed',
+  },
 });
 
 module.exports = mongoose.model("Blockchain_Transactions", TransactionsSchema, "transactions");

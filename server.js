@@ -5,36 +5,35 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const { spawn } = require('child_process');
 const { ethers } = require('ethers');
-const http = require('http'); // Added for Socket.IO
-const { Server } = require('socket.io'); // Added for Socket.IO
+const http = require('http'); // For Socket.IO
+const { Server } = require('socket.io'); // For Socket.IO
 
 const TransactionsSchema = require('./models/TransactionsSchema');
 
 dotenv.config();
 const app = express();
-const server = http.createServer(app); // Create HTTP server manually
-const io = new Server(server, { cors: { origin: '*' } }); // Enable Socket.IO
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(cors());
 app.use(express.json());
 
-// Custom log emitter (logs to console + sends to browser)
+// Custom log emitter
 function logToClient(msg) {
   console.log(msg);
   io.emit('server-log', msg);
 }
 
-// Ethereum setup (optional on-chain logging)
-const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-const wallet = new ethers.Wallet(process.env.SEPOLIA_PRIVATE_KEY || '', provider);
-
-// MongoDB connection
+// ✅ Connect to MongoDB
 mongoose.connect(process.env.MONGOURI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
 })
-  .then(() => logToClient('✅ MongoDB connection success!'))
-  .catch((e) => logToClient(`❌ MongoDB connection error: ${e}`));
+  .then(() => logToClient('✅ MongoDB connection successful!'))
+  .catch((err) => {
+    logToClient('❌ MongoDB connection error: ' + err);
+    process.exit(1);
+  });
 
 // Helper: get PayPal access token
 async function getPayPalAccessToken() {
@@ -54,72 +53,44 @@ async function getPayPalAccessToken() {
 // Route: Send Money
 app.post('/send-money', async (req, res) => {
   try {
-    const { sender, recipient, amount, signature, broadcastToEthereum } = req.body;
+    const { sender, recipient, amount, broadcastToEthereum } = req.body;
 
-    if (!sender || !recipient || !amount || !signature) {
-      logToClient('⚠️ Missing sender, recipient, amount, or signature.');
-      return res.status(400).json({ error: 'Missing sender/recipient/amount/signature' });
+    if (!sender || !recipient || !amount) {
+      logToClient('⚠️ Missing sender, recipient, or amount.');
+      return res.status(400).json({ error: 'Missing sender/recipient/amount' });
     }
 
-    logToClient(`💸 Verifying transaction: ${amount} USD from ${sender} → ${recipient}`);
-    logToClient('🚦 Starting blockchain verification process...');
+    logToClient(`💸 Sending transaction: ${amount} USD from ${sender} → ${recipient}`);
+    logToClient('🚦 Starting blockchain & HMAC verification via Python...');
 
+    const pythonInput = { sender, recipient, amount, broadcastToEthereum };
+
+    // starting python code from here to verify user
     const python = spawn('python', ['../blockchain/blockchain.py']);
-    python.stdin.write(JSON.stringify({ sender, recipient, amount, signature }));
+    python.stdin.write(JSON.stringify(pythonInput));
     python.stdin.end();
 
     python.stdout.on('data', async (data) => {
       let result;
+      
       try {
         result = JSON.parse(data.toString());
       } catch (e) {
         logToClient('❌ Invalid JSON from Python script: ' + data.toString());
-        logToClient('🏁 Execution complete — invalid verifier output.');
         return res.status(500).json({ error: 'Invalid verifier output' });
       }
 
       if (!result.valid) {
         logToClient('❌ Transaction verification failed: ' + result.error);
-        logToClient('🏁 Execution complete — terminated due to failed verification.');
         return res.status(400).json({ error: 'Transaction verification failed', details: result.error });
       }
 
       const blockHash = result.block_hash || null;
       logToClient('✅ Verified by blockchain. Block hash: ' + blockHash);
 
-      // Ethereum broadcast (optional)
-      let ethTxHash = null;
-      if (broadcastToEthereum) {
-        logToClient('🌐 Broadcasting transaction to Ethereum...');
-        try {
-          const metadata = JSON.stringify({
-            sender,
-            recipient,
-            amount,
-            timestamp: Date.now(),
-            block_hash: blockHash,
-          });
-
-          const dataHex = ethers.hexlify(ethers.toUtf8Bytes(metadata));
-          const tx = await wallet.sendTransaction({
-            to: wallet.address,
-            value: 0,
-            data: dataHex,
-          });
-
-          logToClient('🌐 Ethereum tx sent: ' + tx.hash);
-
-          const receipt = await tx.wait();
-          ethTxHash = tx.hash;
-          logToClient(`✅ Ethereum tx confirmed (block ${receipt.blockNumber})`);
-        } catch (ethErr) {
-          logToClient('⚠️ Ethereum logging failed: ' + (ethErr.message || ethErr));
-          logToClient('📦 Continuing with PayPal payout (Ethereum skipped)');
-        }
-      } else {
-        logToClient('⏩ Ethereum broadcast skipped — transaction not logged on-chain.');
-        logToClient('📦 Proceeding to PayPal payout...');
-      }
+      // Always log Ethereum result from Python
+      const ethTxHash = result.ethereum_tx || null;
+      logToClient(`🌐 Ethereum tx status from Python: ${result.ethereum_status}, hash: ${ethTxHash || 'none'}`);
 
       // PayPal Payout
       try {
@@ -158,8 +129,8 @@ app.post('/send-money', async (req, res) => {
           recipient,
           amount,
           blockHash,
-          ethereumTxHash: ethTxHash || null,
-          status: 'completed',
+          ethereumTxHash: ethTxHash,
+          status: result.ethereum_status === 'error' ? 'partial' : 'completed',
           broadcasted: broadcastToEthereum,
           timestamp: new Date(),
         });
@@ -175,6 +146,7 @@ app.post('/send-money', async (req, res) => {
           broadcasted_to_ethereum: broadcastToEthereum,
           paypal_response: payoutRes.data,
         });
+
       } catch (paypalErr) {
         logToClient('❌ PayPal payout failed: ' + (paypalErr.response ? JSON.stringify(paypalErr.response.data) : paypalErr.message));
 
@@ -183,7 +155,7 @@ app.post('/send-money', async (req, res) => {
           recipient,
           amount,
           blockHash,
-          ethereumTxHash: null,
+          ethereumTxHash: ethTxHash || null,
           status: 'failed',
           broadcasted: broadcastToEthereum,
           timestamp: new Date(),
@@ -191,8 +163,6 @@ app.post('/send-money', async (req, res) => {
 
         await failedTx.save();
         logToClient('⚠️ Failed transaction saved to MongoDB.');
-        logToClient('🏁 Execution complete — terminated due to PayPal failure.');
-
         return res.status(500).json({
           error: 'PayPal API error',
           details: paypalErr.response ? paypalErr.response.data : paypalErr.message,
@@ -201,32 +171,30 @@ app.post('/send-money', async (req, res) => {
     });
 
     python.stderr.on('data', (d) => logToClient('🐍 Python stderr: ' + d.toString()));
-    python.on('close', (code) => {
-      logToClient(`🐍 Python exited with code: ${code}`);
-      logToClient('🏁 Request cleanup complete — Python subprocess closed.');
-    });
+    python.on('close', (code) => logToClient(`🐍 Python exited with code: ${code}`));
 
   } catch (err) {
     logToClient('❌ Server error: ' + err);
-    logToClient('🏁 Execution complete — terminated with server error.');
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
-// lets you create a MongoDB record manually, without actually sending money, calling PayPal, or verifying via Python
-// for testing
+// Route to manually create transactions
 app.post('/transactions', async (req, res) => {
   try {
     const { sender, recipient, amount, blockHash, status, broadcasted } = req.body;
+
     const newTx = new TransactionsSchema({
       sender,
       recipient,
       amount,
       blockHash,
-      status: status || 'completed',
-      broadcasted: broadcasted ?? false,
+      ethereumTxHash: ethTxHash || null,
+      status: ethTxHash ? 'completed' : 'partial', // decide based on runtime
+      broadcasted: broadcastToEthereum,
       timestamp: new Date(),
     });
+
 
     await newTx.save();
     logToClient('🗃️ Custom transaction added to MongoDB.');
@@ -237,25 +205,24 @@ app.post('/transactions', async (req, res) => {
   }
 });
 
+// Route to fetch transactions
 app.get('/get-transactions', async (req, res) => {
   try {
     const txs = await TransactionsSchema.find().sort({ timestamp: -1 });
     console.log(`📊 Transactions fetched: ${txs.length}`);
-
     res.json(txs);
-    // (Optional) emit logs to client via socket.io if you’ve set that up
     io.emit('serverLog', `📊 Transactions fetched: ${txs.length}`);
-
   } catch (err) {
     console.error('❌ Error fetching transactions:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
+// Start server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => logToClient(`🚀 Server running on port ${PORT}`));
 
-// Handle client connections
+// Handle Socket.IO connections
 io.on('connection', (socket) => {
   console.log('🧠 Browser connected for live logs.');
   socket.emit('server-log', '📡 Connected to live backend logs!');
