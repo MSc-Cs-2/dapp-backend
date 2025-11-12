@@ -4,16 +4,19 @@ const dotenv = require('dotenv');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { spawn } = require('child_process');
-const { ethers } = require('ethers');
 const http = require('http'); // For Socket.IO
 const { Server } = require('socket.io'); // For Socket.IO
+const bcrypt = require('bcryptjs');
+const jwt = require("jsonwebtoken");
 
 const TransactionsSchema = require('./models/TransactionsSchema');
+const Users = require('./models/Users');
 
 dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+const JWT_SECRET = process.env.JWT_SECRET
 
 app.use(cors());
 app.use(express.json());
@@ -35,14 +38,86 @@ mongoose.connect(process.env.MONGOURI, {
     process.exit(1);
   });
 
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    logToClient(`🧩 [LOGIN] Attempt received for ${email || "(missing email)"}`);
+
+    if (!email || !password) {
+      logToClient("⚠️ [LOGIN] Missing email or password field.");
+      return res.status(400).json({ msg: "Email and password are required" });
+    }
+
+    // Find user in DB
+    const user = await Users.findOne({ email });
+    if (!user) {
+      logToClient(`❌ [LOGIN] No user found for ${email}`);
+      return res.status(404).json({ msg: "User not found" });
+    }
+
+    logToClient(`✅ [LOGIN] User found: ${user.email}`);
+    logToClient(`🔒 [LOGIN] Stored hashed password: ${user.password}`);
+
+    // Compare password with bcrypt
+    const isMatch = await bcrypt.compare(password, user.password);
+    logToClient(`🔍 [LOGIN] bcrypt.compare() result: ${isMatch}`);
+
+    if (!isMatch) {
+      logToClient(`❌ [LOGIN] Password mismatch for ${user.email}`);
+      return res.status(401).json({ msg: "Invalid credentials" });
+    }
+
+    // Generate JWT if passwords match
+    const token = jwt.sign(
+      { id: user._id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "50s" }
+    );
+
+    logToClient(`✅ [LOGIN] Login successful for ${user.email}`);
+    logToClient(`🎟️ [LOGIN] JWT token issued (2h expiry)`);
+
+    res.json({
+      msg: "Login successful",
+      token,
+      email: user.email,
+      role: user.role,
+    });
+  } catch (err) {
+    logToClient(`💥 [LOGIN] Internal error: ${err.message}`);
+    res.status(500).json({ msg: "Internal server error", error: err.message });
+  }
+});
+
+
+// Checks if the incoming request has a valid JWT
+function verifyToken(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(403).json({ msg: "No token provided" });
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(401).json({ msg: "Invalid or expired token" });
+
+    req.user = decoded;
+    next();
+  });
+}
+
+app.get("/me", verifyToken, async (req, res) => {
+  const user = await Users.findById(req.user.id).select("-password");
+  res.json(user);
+});
+
+
 // Helper: get PayPal access token
-async function getPayPalAccessToken() {
+async function getPayPalAccessToken(clientId, clientSecret) {
   const res = await axios({
     url: `${process.env.PAYPAL_API}/v1/oauth2/token`,
     method: 'post',
     auth: {
-      username: process.env.PAYPAL_CLIENT_ID,
-      password: process.env.PAYPAL_SECRET,
+      username: clientId,
+      password: clientSecret,
     },
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     data: 'grant_type=client_credentials',
@@ -62,6 +137,12 @@ app.post('/send-money', async (req, res) => {
 
     logToClient(`💸 Sending transaction: ${amount} USD from ${sender} → ${recipient}`);
     logToClient('🚦 Starting blockchain & HMAC verification via Python...');
+
+    const user = await Users.findOne({ email: sender });
+    if (!user) {
+      logToClient(`❌ ${sender} Sender not found`);
+      return res.status(404).json({ msg: `${sender} not found` });
+    }
 
     const pythonInput = { sender, recipient, amount, broadcastToEthereum };
 
@@ -94,7 +175,7 @@ app.post('/send-money', async (req, res) => {
 
       // PayPal Payout
       try {
-        const token = await getPayPalAccessToken();
+        const token = await getPayPalAccessToken(user.paypal_client_id, user.paypal_client_secret);
         const payoutBody = {
           sender_batch_header: {
             sender_batch_id: `batch_${Date.now()}`,
@@ -206,17 +287,115 @@ app.post('/transactions', async (req, res) => {
 });
 
 // Route to fetch transactions
-app.get('/get-transactions', async (req, res) => {
+app.get('/get-transactions', verifyToken, async (req, res) => {
   try {
-    const txs = await TransactionsSchema.find().sort({ timestamp: -1 });
-    console.log(`📊 Transactions fetched: ${txs.length}`);
+    const userEmail = req.user.email;
+    const isAdmin = req.user.role === 'admin';  // for admin roles
+
+    const filter = isAdmin ? {} : {
+      $or: [{ sender: userEmail }, { recipient: userEmail }]
+    };
+
+    const txs = await TransactionsSchema.find(filter).sort({ timestamp: -1 });
+
+    console.log(`📊 ${isAdmin ? 'Admin' : userEmail} fetched ${txs.length} txs`);
     res.json(txs);
-    io.emit('serverLog', `📊 Transactions fetched: ${txs.length}`);
+    
   } catch (err) {
-    console.error('❌ Error fetching transactions:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
+
+
+app.get('/user-data', async (req, res) => {
+  try {
+    const userData = await Users.find();
+    return res.json(userData);
+
+  } catch (error) {
+    res.status(500).json({ msg: `Unable to fetch data: ${error} `});
+  }
+});
+
+app.post("/dev/user", async (req, res) => {
+  try {
+    const devToken = req.headers["x-dev-token"];
+    if (devToken !== process.env.DEV_ADMIN_TOKEN) {
+      return res.status(403).json({ msg: "Unauthorized dev access" });
+    }
+
+    const {
+      action,
+      name,
+      email,
+      password,
+      role,
+      paypal_client_id,
+      paypal_client_secret,
+      sandbox_email,
+      newPassword,
+    } = req.body;
+
+    switch (action) {
+      // ✅ CREATE USER
+      case "create":
+        if (!email || !password || !paypal_client_id || !paypal_client_secret) {
+          return res.status(400).json({ msg: "Missing required fields" });
+        }
+
+        const existingUser = await Users.findOne({ email });
+        if (existingUser)
+          return res.status(409).json({ msg: "User already exists" });
+
+        // ⚙️ Let the Mongoose pre-save hook hash the password automatically
+        const newUser = new Users({
+          name,
+          email,
+          password, // plain here; schema will hash before save
+          role: role || "user",
+          paypal_client_id,
+          paypal_client_secret,
+          sandbox_email,
+        });
+
+        await newUser.save();
+        return res.json({ msg: `✅ User created successfully: ${email}` });
+
+      // ✅ CHANGE PASSWORD
+      case "change-password":
+        if (!email || !newPassword)
+          return res.status(400).json({ msg: "Missing email or new password" });
+
+        const user = await Users.findOne({ email });
+        if (!user) return res.status(404).json({ msg: "User not found" });
+
+        // ⚙️ assign plain text — will be hashed automatically by pre-save hook
+        user.password = newPassword;
+        await user.save();
+
+        return res.json({ msg: `🔑 Password updated successfully: ${email}` });
+
+      // ✅ LIST USERS (passwords hidden)
+      case "list":
+        const users = await Users.find({}, "-password");
+        return res.json(users);
+
+      // ✅ DELETE USER
+      case "delete":
+        if (!email)
+          return res.status(400).json({ msg: "Email required for deletion" });
+        await Users.deleteOne({ email });
+        return res.json({ msg: `🗑️ User ${email} deleted` });
+
+      default:
+        return res.status(400).json({ msg: "Invalid action" });
+    }
+  } catch (err) {
+    console.error("❌ Dev route error:", err);
+    res.status(500).json({ msg: "Internal server error", error: err.message });
+  }
+});
+
 
 // Start server
 const PORT = process.env.PORT || 5000;
