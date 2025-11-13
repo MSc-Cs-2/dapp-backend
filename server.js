@@ -70,13 +70,13 @@ app.post("/login", async (req, res) => {
 
     // Generate JWT if passwords match
     const token = jwt.sign(
-      { id: user._id, email: user.email, role: user.role },
+      { id: user._id, email: user.email, role: user.role, name: user.name },
       JWT_SECRET,
-      { expiresIn: "50s" }
+      { expiresIn: "2h" }
     );
 
     logToClient(`✅ [LOGIN] Login successful for ${user.email}`);
-    logToClient(`🎟️ [LOGIN] JWT token issued (2h expiry)`);
+    logToClient(`🎟️ [LOGIN] JWT token issued -> expires in 2h`);
 
     res.json({
       msg: "Login successful",
@@ -307,16 +307,17 @@ app.get('/get-transactions', verifyToken, async (req, res) => {
 });
 
 
-app.get('/user-data', async (req, res) => {
-  try {
-    const userData = await Users.find();
-    return res.json(userData);
+// app.get('/user-data', async (req, res) => {
+//   try {
+//     const userData = await Users.find();
+//     return res.json(userData);
 
-  } catch (error) {
-    res.status(500).json({ msg: `Unable to fetch data: ${error} `});
-  }
-});
+//   } catch (error) {
+//     res.status(500).json({ msg: `Unable to fetch data: ${error} `});
+//   }
+// });
 
+// internal
 app.post("/dev/user", async (req, res) => {
   try {
     const devToken = req.headers["x-dev-token"];
